@@ -2,46 +2,84 @@ import { io } from 'socket.io-client';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform, Alert } from 'react-native';
 import NetInfo from '@react-native-community/netinfo';
-import { API_BASE_URL, getBaseServerUrl } from './api';  // Import the API base URL to ensure consistency
-import NetworkDiagnostic from './networkDiagnostic'; // Import the enhanced network diagnostics
+import { API_BASE_URL, getBaseServerUrl } from './api';
+import NetworkDiagnostic from './networkDiagnostic';
 
 let socket = null;
 let connectionAttempts = 0;
 const MAX_RECONNECTION_ATTEMPTS = 5;
-// Track when we've abandoned reconnection to avoid duplicate alerts
 let reconnectionAbandoned = false;
-// For multicast discovery testing
 let serverDiscoveryInProgress = false;
+let unsubscribeNetInfo = null;
+
+// Enhanced network change handler with profile support
+const setupNetworkListener = () => {
+  if (unsubscribeNetInfo) {
+    unsubscribeNetInfo();
+  }
+
+  unsubscribeNetInfo = NetInfo.addEventListener(async (state) => {
+    console.log('Network state changed:', state);
+    
+    if (state.isConnected) {
+      // Wait for network to stabilize
+      setTimeout(async () => {
+        try {
+          // Try to load network profile first
+          const profile = await NetworkDiagnostic.loadNetworkProfile();
+          if (profile) {
+            console.log('Found network profile, attempting to connect...');
+            const result = await NetworkDiagnostic.testServerConnection(profile.serverIP);
+            if (result.success) {
+              await setServerIP(profile.serverIP);
+              await initializeSocket();
+              return;
+            }
+          }
+
+          // If profile doesn't exist or fails, try mDNS
+          try {
+            const response = await fetch('http://sat-server.local:50002/health', {
+              timeout: 2000
+            });
+            if (response.ok) {
+              console.log('Found server via mDNS');
+              await setServerIP('sat-server.local');
+              await initializeSocket();
+              return;
+            }
+          } catch (e) {
+            // mDNS failed, continue with other methods
+          }
+
+          // Try to discover server on the new network
+          const discoveredServer = await NetworkDiagnostic.discoverServer();
+          if (discoveredServer) {
+            console.log('Found server on new network:', discoveredServer);
+            await NetworkDiagnostic.saveNetworkProfile(discoveredServer.ip);
+            await setServerIP(discoveredServer.ip);
+            await initializeSocket();
+          }
+        } catch (error) {
+          console.error('Error handling network change:', error);
+        }
+      }, 2000);
+    }
+  });
+};
 
 // Helper to get the correct URL based on platform
 const getSocketUrl = async () => {
   try {
-    // First try to discover server using multiple strategies
-    if (!serverDiscoveryInProgress) {
-      serverDiscoveryInProgress = true;
-      const discoveredServer = await NetworkDiagnostic.discoverServer();
-      serverDiscoveryInProgress = false;
-      
-      if (discoveredServer) {
-        console.log(`Server discovered at: ${discoveredServer.ip}:${discoveredServer.port}`);
-        // If we discovered a working server, save it for future use
-        await setServerIP(discoveredServer.ip);
-        return `http://${discoveredServer.ip}:${discoveredServer.port}`;
-      }
-    }
-    
-    // Fall back to stored server IP
-    const savedServerIP = await AsyncStorage.getItem('serverIP');
-    
-    // Default values if no stored IP
-    let serverIP = savedServerIP || '192.168.0.105';
+    const serverIP = await AsyncStorage.getItem('serverIP') || '192.168.0.159';
     const serverPort = '50002';
     
-    // If web, prefer localhost
     if (Platform.OS === 'web') {
       return `http://localhost:${serverPort}`;
-    } else if (Platform.OS === 'android') {
-      // For Android emulator, use the special emulator host IP
+    }
+    
+    // For Android emulator, use the special emulator host IP
+    if (Platform.OS === 'android') {
       const netInfo = await NetInfo.fetch();
       if (netInfo.type === 'wifi' && netInfo.details && netInfo.details.isEmulator) {
         return `http://10.0.2.2:${serverPort}`;
@@ -52,7 +90,7 @@ const getSocketUrl = async () => {
     return `http://${serverIP}:${serverPort}`;
   } catch (error) {
     console.warn('Error getting socket URL:', error);
-    return 'http://192.168.0.105:50002'; // Fallback to default
+    return 'http://192.168.0.159:50002'; // Updated fallback to correct IP
   }
 };
 
@@ -124,9 +162,35 @@ const checkNetworkConnectivity = async () => {
   }
 };
 
-// Try connection with multiple fallback strategies
+// Enhanced connection strategy with profile support
 const tryMultipleConnections = async () => {
-  // Try the API-derived URL first
+  // Try loading network profile first
+  try {
+    const profile = await NetworkDiagnostic.loadNetworkProfile();
+    if (profile) {
+      const isHealthy = await testServerHealth(`http://${profile.serverIP}:50002`);
+      if (isHealthy) {
+        console.log('Connected using saved network profile');
+        return `http://${profile.serverIP}:50002`;
+      }
+    }
+  } catch (error) {
+    console.log('Error using network profile:', error);
+  }
+
+  // Try mDNS first
+  try {
+    const response = await fetch('http://sat-server.local:50002/health', {
+      timeout: 2000
+    });
+    if (response.ok) {
+      return 'http://sat-server.local:50002';
+    }
+  } catch (e) {
+    // mDNS failed, continue with other methods
+  }
+
+  // Try the API-derived URL
   try {
     const apiUrl = await getBaseServerUrl();
     if (apiUrl) {
@@ -150,14 +214,12 @@ const tryMultipleConnections = async () => {
   } catch (error) {
     console.log('Server discovery failed:', error);
   }
-  
-  // Try localhost and emulator-specific IPs based on platform
+
+  // Try platform-specific defaults
   if (Platform.OS === 'ios') {
     const localhostUrl = 'http://localhost:50002';
     const isHealthy = await testServerHealth(localhostUrl);
-    if (isHealthy) {
-      return localhostUrl;
-    }
+    if (isHealthy) return localhostUrl;
   } else if (Platform.OS === 'android') {
     const emulatorUrl = 'http://10.0.2.2:50002';
     const isHealthy = await testServerHealth(emulatorUrl);
@@ -166,13 +228,28 @@ const tryMultipleConnections = async () => {
       return emulatorUrl;
     }
   }
-  
+
+  // Try saved location profiles as last resort
+  try {
+    const location = await NetworkDiagnostic.autoDetectLocation();
+    if (location) {
+      return `http://${location.serverIP}:50002`;
+    }
+  } catch (error) {
+    console.log('Location profile detection failed:', error);
+  }
+
   // Last resort: try the generated socket URL
   return await getSocketUrl();
 };
 
 export const initializeSocket = async () => {
   try {
+    // Setup network change listener if not already setup
+    if (!unsubscribeNetInfo) {
+      setupNetworkListener();
+    }
+    
     // First check network connectivity
     const isConnected = await checkNetworkConnectivity();
     if (!isConnected) {

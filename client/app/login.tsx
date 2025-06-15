@@ -14,12 +14,14 @@ import {
   StatusBar,
   SafeAreaView,
   ViewStyle,
+  Alert,
 } from "react-native";
-import { useRouter } from "expo-router";
+import { useRouter, Link } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import Animated, { FadeInDown } from "react-native-reanimated";
 import { useAuth } from "./contexts/AuthContext";
-import { fonts, colors, spacing } from "./constants/theme";
+import { colors, fonts, spacing } from "./constants/theme";
+import api from "./utils/api";
 import NetworkConfig from "./components/NetworkConfig";
 
 export default function LoginScreen() {
@@ -31,7 +33,8 @@ export default function LoginScreen() {
   const [error, setError] = useState<string | null>(null);
   const { height } = useWindowDimensions();
   const [showNetworkModal, setShowNetworkModal] = useState(false);
-  
+  const [isLoading, setIsLoading] = useState(false);
+
   // Calculate dynamic top padding based on screen height
   const dynamicTopPadding = Math.max(height * 0.03, 20);
 
@@ -43,14 +46,21 @@ export default function LoginScreen() {
 
   const handleLogin = async () => {
     if (!email || !password) {
-      setError("Please enter both email and password");
+      Alert.alert("Error", "Please fill in all fields");
       return;
     }
-    
+
     try {
+      setIsLoading(true);
       await login(email, password);
-    } catch (err) {
-      // Error is handled in the auth context
+    } catch (error) {
+      console.error("Login error:", error);
+      Alert.alert(
+        "Login Failed",
+        error.response?.data?.message || "An error occurred during login"
+      );
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -75,11 +85,11 @@ export default function LoginScreen() {
         behavior={Platform.OS === "ios" ? "padding" : undefined}
         keyboardVerticalOffset={Platform.OS === "ios" ? 80 : 0}
       >
-        <ScrollView 
+        <ScrollView
           contentContainerStyle={dynamicContainerStyle}
           showsVerticalScrollIndicator={false}
         >
-          <Animated.View 
+          <Animated.View
             entering={FadeInDown.delay(200).springify()}
             style={styles.logoContainer}
           >
@@ -94,7 +104,7 @@ export default function LoginScreen() {
             </Text>
           </Animated.View>
 
-          <Animated.View 
+          <Animated.View
             entering={FadeInDown.delay(400).springify()}
             style={styles.formContainer}
           >
@@ -109,7 +119,12 @@ export default function LoginScreen() {
             )}
 
             <View style={styles.inputContainer}>
-              <Ionicons name="mail-outline" size={20} color="#64748b" style={styles.inputIcon} />
+              <Ionicons
+                name="mail-outline"
+                size={20}
+                color="#64748b"
+                style={styles.inputIcon}
+              />
               <TextInput
                 style={styles.input}
                 placeholder="Email Address"
@@ -119,11 +134,17 @@ export default function LoginScreen() {
                 keyboardType="email-address"
                 autoCapitalize="none"
                 autoComplete="email"
+                editable={!isLoading}
               />
             </View>
 
             <View style={styles.inputContainer}>
-              <Ionicons name="lock-closed-outline" size={20} color="#64748b" style={styles.inputIcon} />
+              <Ionicons
+                name="lock-closed-outline"
+                size={20}
+                color="#64748b"
+                style={styles.inputIcon}
+              />
               <TextInput
                 style={styles.input}
                 placeholder="Password"
@@ -133,6 +154,7 @@ export default function LoginScreen() {
                 secureTextEntry={!showPassword}
                 autoCapitalize="none"
                 autoComplete="password"
+                editable={!isLoading}
               />
               <TouchableOpacity
                 style={styles.passwordToggle}
@@ -147,25 +169,28 @@ export default function LoginScreen() {
             </View>
 
             <View style={styles.actionRow}>
-              <TouchableOpacity 
-                style={styles.configButton} 
+              <TouchableOpacity
+                style={styles.configButton}
                 onPress={() => setShowNetworkModal(true)}
               >
                 <Ionicons name="settings-outline" size={18} color="#64748b" />
                 <Text style={styles.configButtonText}>Network Config</Text>
               </TouchableOpacity>
-              
+
               <TouchableOpacity style={styles.forgotPassword}>
                 <Text style={styles.forgotPasswordText}>Forgot Password?</Text>
               </TouchableOpacity>
             </View>
 
             <TouchableOpacity
-              style={[styles.loginButton, (authLoading || !email || !password) && styles.disabledButton]}
+              style={[
+                styles.loginButton,
+                (authLoading || !email || !password) && styles.disabledButton,
+              ]}
               onPress={handleLogin}
               disabled={authLoading || !email || !password}
             >
-              {authLoading ? (
+              {isLoading ? (
                 <ActivityIndicator color="#ffffff" size="small" />
               ) : (
                 <Text style={styles.loginButtonText}>Log In</Text>
@@ -173,22 +198,24 @@ export default function LoginScreen() {
             </TouchableOpacity>
           </Animated.View>
 
-          <Animated.View 
+          <Animated.View
             entering={FadeInDown.delay(1000).springify()}
             style={styles.signupContainer}
           >
             <Text style={styles.signupText}>Don't have an account? </Text>
-            <TouchableOpacity onPress={() => navigateTo("signup")}>
-              <Text style={styles.signupLink}>Sign Up</Text>
-            </TouchableOpacity>
+            <Link href="/signup" asChild>
+              <TouchableOpacity>
+                <Text style={styles.signupLink}>Sign Up</Text>
+              </TouchableOpacity>
+            </Link>
           </Animated.View>
         </ScrollView>
       </KeyboardAvoidingView>
-      
+
       {/* Network Configuration Modal */}
-      <NetworkConfig 
-        visible={showNetworkModal} 
-        onClose={() => setShowNetworkModal(false)} 
+      <NetworkConfig
+        visible={showNetworkModal}
+        onClose={() => setShowNetworkModal(false)}
       />
     </SafeAreaView>
   );
@@ -261,14 +288,14 @@ const styles = StyleSheet.create({
     padding: 10,
   },
   actionRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
     marginBottom: 24,
   },
   configButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
+    flexDirection: "row",
+    alignItems: "center",
     padding: 4,
   },
   configButtonText: {

@@ -5,6 +5,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const jwt = require('jsonwebtoken');
+const os = require('os');
 
 // Load environment variables
 dotenv.config();
@@ -24,23 +25,27 @@ const sessionsRoutes = require('./routes/collaborate/sessions');
 const app = express();
 const server = http.createServer(app);
 
+// Enhanced CORS configuration
+const corsOptions = {
+  origin: '*', // In production, you should list your specific domains
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  exposedHeaders: ['Content-Range', 'X-Content-Range'],
+  credentials: true,
+  maxAge: 86400 // Preflight results cache for 24 hours
+};
+
+app.use(cors(corsOptions));
+
 // Enhanced Socket.IO configuration with better error handling
 const io = socketIo(server, {
-  cors: {
-    origin: "*", // Allow all origins
-    methods: ["GET", "POST", "PUT", "DELETE"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true
-  },
-  // Use both transports, but try polling first for greater compatibility
+  cors: corsOptions,
   transports: ['polling', 'websocket'],
-  // Increase ping timeout and interval for more reliable connections
-  pingTimeout: 30000,
+  pingTimeout: 60000,
   pingInterval: 25000,
-  // Adjust connection timeout to avoid early connection failures
-  connectTimeout: 15000,
-  // Allow more connection attempts
-  maxHttpBufferSize: 1e6 // 1MB for larger payloads
+  connectTimeout: 30000,
+  maxHttpBufferSize: 1e6,
+  allowEIO3: true // Enable compatibility with Socket.IO v3 clients
 });
 
 // Make io accessible within request object
@@ -49,40 +54,81 @@ app.use((req, res, next) => {
   next();
 });
 
-// Enhanced Middleware for CORS to support websockets better
-app.use(express.json());
-app.use(cors({
-  origin: "*", // Allow all origins
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: true,
-  preflightContinue: false,
-  optionsSuccessStatus: 204
-}));
+// Body parser middleware with size limits
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
-// Routes
-app.use('/api/auth', authRoutes);
-app.use('/api/users', userRoutes);
-app.use('/api/projects', projectRoutes);
-app.use('/api/messages', messageRoutes);
-app.use('/api/profile', profileRoutes);
-app.use('/api/communities', communityRoutes);
-app.use('/api/events', eventRoutes);
-app.use('/api/collaborate/activities', activitiesRoutes);
-app.use('/api/collaborate/sessions', sessionsRoutes);
+// Add request logging middleware
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+  next();
+});
+
+// Add a detailed health check endpoint
+app.get('/health', (req, res) => {
+  const healthData = {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    hostname: os.hostname(),
+    memory: process.memoryUsage(),
+    cpu: os.cpus()[0],
+    network: os.networkInterfaces()
+  };
+
+  res.status(200).json(healthData);
+});
+
+// Routes with version prefix
+const API_PREFIX = '/api';
+app.use(`${API_PREFIX}/auth`, authRoutes);
+app.use(`${API_PREFIX}/users`, userRoutes);
+app.use(`${API_PREFIX}/projects`, projectRoutes);
+app.use(`${API_PREFIX}/messages`, messageRoutes);
+app.use(`${API_PREFIX}/profile`, profileRoutes);
+app.use(`${API_PREFIX}/communities`, communityRoutes);
+app.use(`${API_PREFIX}/events`, eventRoutes);
+app.use(`${API_PREFIX}/collaborate/activities`, activitiesRoutes);
+app.use(`${API_PREFIX}/collaborate/sessions`, sessionsRoutes);
+
+// 404 handler
+app.use((req, res, next) => {
+  res.status(404).json({
+    success: false,
+    message: `Route ${req.originalUrl} not found`
+  });
+});
 
 // Enhanced error handling middleware
 app.use((err, req, res, next) => {
   console.error('Server error:', err.stack);
-  res.status(500).json({
-    message: 'Internal Server Error',
+  
+  // Handle different types of errors
+  if (err.name === 'ValidationError') {
+    return res.status(400).json({
+      success: false,
+      message: 'Validation Error',
+      errors: Object.values(err.errors).map(e => e.message)
+    });
+  }
+  
+  if (err.name === 'MongoError' && err.code === 11000) {
+    return res.status(409).json({
+      success: false,
+      message: 'Duplicate field value entered'
+    });
+  }
+  
+  res.status(err.status || 500).json({
+    success: false,
+    message: err.message || 'Internal Server Error',
     error: process.env.NODE_ENV === 'production' ? {} : err
   });
 });
 
 // Socket.IO connection handler with enhanced error handling
 io.on('connection', (socket) => {
-  console.log('New client connected', socket.id);
+  console.log('New client connected:', socket.id);
   
   // Handle socket connection errors
   socket.on('error', (error) => {
@@ -93,8 +139,7 @@ io.on('connection', (socket) => {
   socket.on('authenticate', async (token) => {
     try {
       if (!token) {
-        console.log('No token provided for socket authentication');
-        return;
+        throw new Error('No token provided for socket authentication');
       }
       
       // Verify the token
@@ -111,7 +156,7 @@ io.on('connection', (socket) => {
       // Send acknowledgment back to client
       socket.emit('authentication_success', { userId });
     } catch (error) {
-      console.error('Socket authentication error:', error.message);
+      console.error('Socket authentication error:', error);
       socket.emit('authentication_error', { message: 'Authentication failed' });
     }
   });
@@ -252,24 +297,57 @@ io.on('connection', (socket) => {
   });
 });
 
-// Add a simple health check endpoint
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok', time: new Date().toISOString() });
-});
-
-// Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => {
-    console.log('Connected to MongoDB');
+// Connect to MongoDB with enhanced options
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+  serverSelectionTimeoutMS: 5000,
+  socketTimeoutMS: 45000,
+  family: 4
+})
+.then(() => {
+  console.log('Connected to MongoDB');
+  const PORT = process.env.PORT || 50002;
+  
+  // Listen on all interfaces
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on port ${PORT} and listening on all interfaces`);
+    const networkInterfaces = os.networkInterfaces();
+    console.log('\nAvailable on:');
     
-    // Start server - listen on all network interfaces (0.0.0.0) instead of just localhost
-    const PORT = process.env.PORT || 50002;
-    server.listen(PORT, '0.0.0.0', () => {
-      console.log(`Server running on port ${PORT} and listening on all interfaces`);
-      console.log(`Health check available at http://localhost:${PORT}/health`);
-    });
-  })
-  .catch(err => {
-    console.error('MongoDB connection error:', err.message);
-    process.exit(1);
+    for (const [name, interfaces] of Object.entries(networkInterfaces)) {
+      for (const iface of interfaces) {
+        if (iface.family === 'IPv4') {
+          console.log(`- http://${iface.address}:${PORT}`);
+        }
+      }
+    }
+    
+    console.log(`\nHealth check available at: http://${networkInterfaces.en0?.[0]?.address || '192.168.0.191'}:${PORT}/health`);
   });
+
+  // Handle graceful shutdown
+  const gracefulShutdown = () => {
+    console.log('\nReceived shutdown signal. Closing server...');
+    server.close(() => {
+      console.log('Server closed. Disconnecting from MongoDB...');
+      mongoose.connection.close(false, () => {
+        console.log('MongoDB connection closed. Exiting...');
+        process.exit(0);
+      });
+    });
+    
+    // Force exit after 10 seconds
+    setTimeout(() => {
+      console.error('Could not close connections in time, forcefully shutting down');
+      process.exit(1);
+    }, 10000);
+  };
+
+  process.on('SIGTERM', gracefulShutdown);
+  process.on('SIGINT', gracefulShutdown);
+})
+.catch(err => {
+  console.error('MongoDB connection error:', err);
+  process.exit(1);
+});

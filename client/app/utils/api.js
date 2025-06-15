@@ -1,256 +1,117 @@
 import axios from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform } from 'react-native';
-import NetInfo from '@react-native-community/netinfo';
-import NetworkDiagnostic from './networkDiagnostic';
+import { checkDeviceConnectivity, discoverServer } from './networkDiagnostic';
 
-// Enhanced server URL discovery using our improved network diagnostic tools
-const getServerUrl = async () => {
-  try {
-    // First try to use our network discovery mechanism to find the server
-    const discoveredServer = await NetworkDiagnostic.discoverServer();
-    if (discoveredServer) {
-      console.log(`Using discovered server at ${discoveredServer.ip}:${discoveredServer.port}`);
-      return `http://${discoveredServer.ip}:${discoveredServer.port}/api`;
-    }
-    
-    // If discovery fails, try saved server IP
-    const savedServerIP = await AsyncStorage.getItem('serverIP');
-    
-    // Default values if no stored IP - get local IP from network info
-    let serverIP = savedServerIP;
-    if (!serverIP) {
-      // Try to detect local network IP automatically
-      const networkState = await NetInfo.fetch();
-      if (networkState.details && networkState.details.ipAddress) {
-        // Use device's IP as a base for guessing server IP in same network
-        const deviceIP = networkState.details.ipAddress;
-        // Extract network prefix from device IP (first 3 octets)
-        const networkPrefix = deviceIP.split('.').slice(0, 3).join('.');
-        
-        // Try common local IPs in the same subnet
-        // For development environments, localhost and 10.0.2.2 are common for emulators
-        if (Platform.OS === 'android') {
-          serverIP = '10.0.2.2'; // Android emulator default for localhost
-        } else {
-          // Prefer common server IPs in the network
-          const commonIPs = [
-            `${networkPrefix}.1`,   // Router
-            `${networkPrefix}.100`, // Common server IP
-            `${networkPrefix}.105`, // Current default
-            `${networkPrefix}.110`  // Another common option
-          ];
-          
-          // Test each IP in parallel and use the first one that responds
-          const results = await Promise.all(
-            commonIPs.map(ip => NetworkDiagnostic.testServerConnection(ip))
-          );
-          
-          const workingServer = results.find(result => result.success);
-          if (workingServer) {
-            serverIP = workingServer.ip;
-            await AsyncStorage.setItem('serverIP', serverIP);
-            console.log(`Found working server at: ${serverIP}`);
-          } else {
-            // Fall back to router as best guess
-            serverIP = `${networkPrefix}.1`;
-          }
-        }
-        
-        console.log(`Network: ${networkPrefix}, using server IP: ${serverIP}`);
-      } else {
-        // Fall back to default IP
-        serverIP = '192.168.0.105';
-      }
-    }
-    
-    const serverPort = '50002';
-    const apiPath = '/api';
-    
-    if (Platform.OS === 'web') {
-      // For web development
-      return `http://localhost:${serverPort}${apiPath}`;
-    } else {
-      // Special case for Android emulator
-      if (Platform.OS === 'android' && serverIP === '10.0.2.2') {
-        return `http://10.0.2.2:${serverPort}${apiPath}`;
-      }
-      // For iOS and Android, use the saved/default IP address
-      return `http://${serverIP}:${serverPort}${apiPath}`;
-    }
-  } catch (error) {
-    console.error('Error getting server URL:', error);
-    return `http://192.168.0.105:50002/api`; // Fallback
-  }
-};
-
-// Get base server URL (without /api) for socket connection
-export const getBaseServerUrl = async () => {
-  try {
-    // First try to use our network discovery mechanism to find the server
-    const discoveredServer = await NetworkDiagnostic.discoverServer();
-    if (discoveredServer) {
-      console.log(`Using discovered base server URL: ${discoveredServer.ip}:${discoveredServer.port}`);
-      return `http://${discoveredServer.ip}:${discoveredServer.port}`;
-    }
-    
-    // If that fails, try saved server IP
-    const savedServerIP = await AsyncStorage.getItem('serverIP');
-    const serverIP = savedServerIP || '192.168.0.105'; // Use saved IP or default
-    const serverPort = '50002';
-    
-    if (Platform.OS === 'web') {
-      // For web development
-      return `http://localhost:${serverPort}`;
-    } else if (Platform.OS === 'android' && !savedServerIP) {
-      // Try Android emulator host if no saved IP
-      const emulatorUrl = 'http://10.0.2.2:50002';
-      const isHealthy = await NetworkDiagnostic.testServerConnection('10.0.2.2');
-      if (isHealthy.success) {
-        return emulatorUrl;
-      }
-    }
-    
-    // For iOS and Android, use the saved/default IP address
-    return `http://${serverIP}:${serverPort}`;
-  } catch (error) {
-    console.error('Error getting base server URL:', error);
-    return `http://192.168.0.105:50002`; // Fallback
-  }
-};
-
-// Create a placeholder for the API_BASE_URL that will be initialized on first use
-let _API_BASE_URL = null;
-
-// Export the API base URL for use in other modules
-export const API_BASE_URL = (() => {
-  // If we don't have the URL yet, use the default
-  if (!_API_BASE_URL) {
-    return 'http://192.168.0.105:50002/api';
-  }
-  return _API_BASE_URL;
-})();
-
-// Initialize the API with a mutable config that can be updated
+// Create axios instance with custom config
 const api = axios.create({
-  // We'll set the baseURL after initialization
+  baseURL: 'http://192.168.0.159:50002/api', // Updated to correct server IP
+  timeout: 30000,
   headers: {
-    'Content-Type': 'application/json'
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
   },
-  timeout: 20000 // Increased timeout to 20 seconds for better reliability
+  validateStatus: status => status >= 200 && status < 500
 });
 
-// Enhanced retry capability for network errors
-api.interceptors.response.use(
-  response => response,
-  async error => {
-    const { config } = error;
-    
-    // Only retry on network errors or timeouts
-    if (!error.response && error.code !== 'ECONNABORTED' && !config._retry) {
-      config._retry = true;
-      console.log('Network error detected. Attempting to find a working server...');
-      
-      try {
-        // Try to discover a working server
-        const discoveredServer = await NetworkDiagnostic.discoverServer();
-        if (discoveredServer) {
-          // Update stored IP
-          await AsyncStorage.setItem('serverIP', discoveredServer.ip);
-          
-          // Update API base URL
-          const newApiUrl = `http://${discoveredServer.ip}:${discoveredServer.port}/api`;
-          _API_BASE_URL = newApiUrl;
-          api.defaults.baseURL = newApiUrl;
-          
-          console.log(`Found working server. Retrying request with new URL: ${newApiUrl}`);
-          
-          // Update the request URL and retry
-          config.baseURL = newApiUrl;
-          return axios(config);
-        }
-      } catch (retryError) {
-        console.error('Error during retry attempt:', retryError);
-      }
-    }
-    
-    return Promise.reject(error);
-  }
-);
-
-// Function to initialize the API with the correct base URL
+// Initialize the API with health check
 export const initializeAPI = async () => {
   try {
-    const apiUrl = await getServerUrl();
-    const baseUrl = await getBaseServerUrl();
+    const serverIP = await AsyncStorage.getItem('serverIP');
+    if (serverIP) {
+      api.defaults.baseURL = `http://${serverIP}:50002/api`;
+    }
     
-    // Update the module-level API_BASE_URL value
-    _API_BASE_URL = apiUrl;
+    const healthURL = api.defaults.baseURL.replace('/api', '/health');
+    console.log('Testing connection to server:', healthURL);
     
-    // Update axios instance base URL
-    api.defaults.baseURL = apiUrl;
-    
-    console.log(`API initialized with base URL: ${apiUrl}`);
-    console.log(`Base server URL: ${baseUrl}`);
-    
-    return { apiUrl, baseUrl };
+    const response = await axios.get(healthURL, { timeout: 5000 });
+    if (response.status === 200) {
+      console.log('Successfully connected to server');
+      return true;
+    }
+    return false;
   } catch (error) {
-    console.error('Error initializing API:', error);
-    
-    // Use default values
-    api.defaults.baseURL = 'http://192.168.0.105:50002/api';
-    return { 
-      apiUrl: 'http://192.168.0.105:50002/api', 
-      baseUrl: 'http://192.168.0.105:50002' 
-    };
+    console.error('Error connecting to server:', error.message);
+    return false;
   }
 };
 
-// Call initializeAPI on module load
-initializeAPI().catch(error => {
-  console.error('Failed to initialize API on module load:', error);
-});
-
-// Add authorization token to requests if available
+// Request interceptor
 api.interceptors.request.use(
   async (config) => {
     try {
+      const connectivity = await checkDeviceConnectivity();
+      if (!connectivity.isConnected) {
+        throw new Error('No network connection available');
+      }
+
+      // Add auth token if available
       const token = await AsyncStorage.getItem('token');
       if (token) {
-        config.headers['Authorization'] = `Bearer ${token}`;
+        config.headers.Authorization = `Bearer ${token}`;
       }
+
+      console.log('Starting Request:', config.method?.toUpperCase(), api.defaults.baseURL + config.url);
+      return config;
     } catch (error) {
-      console.error('Error retrieving auth token:', error);
+      return Promise.reject(error);
     }
-    return config;
   },
   (error) => {
+    console.error('Request interceptor error:', error);
     return Promise.reject(error);
   }
 );
 
-// Logging interceptor to help with debugging
-api.interceptors.request.use(request => {
-  console.log('Starting Request:', request.method, request.baseURL + request.url);
-  return request;
-});
-
+// Response interceptor
 api.interceptors.response.use(
-  response => {
-    console.log('Response Status:', response.status);
+  (response) => {
+    console.log('Response received:', response.status);
     return response;
   },
-  error => {
-    if (error.response) {
-      console.error('Error Response:', error.response.status, error.response.data);
+  async (error) => {
+    let errorMessage = 'An unexpected error occurred';
+
+    if (error.message === 'Network Error') {
+      // Try to get more specific network error information
+      const connectivity = await checkDeviceConnectivity();
+      if (!connectivity.isConnected) {
+        errorMessage = 'No network connection available. Please check your internet connection.';
+      } else {
+        errorMessage = `Network error: Could not connect to server at ${api.defaults.baseURL}. Please check if the server is running.`;
+      }
+    } else if (error.response) {
+      // Server responded with error
+      errorMessage = error.response.data?.message || `Server error: ${error.response.status}`;
     } else if (error.request) {
-      console.error('No Response:', error.request);
-    } else {
-      console.error('Error:', error.message);
+      // Request was made but no response received
+      errorMessage = 'No response received from server. Please check your connection and try again.';
     }
-    return Promise.reject(error);
+
+    // Enhance error object with additional context
+    const enhancedError = {
+      ...error,
+      message: errorMessage,
+      originalError: error.message,
+      timestamp: new Date().toISOString(),
+      networkInfo: await checkDeviceConnectivity(),
+      serverUrl: api.defaults.baseURL
+    };
+
+    console.error('API Error:', {
+      url: error.config?.url,
+      method: error.config?.method,
+      status: error.response?.status,
+      message: errorMessage,
+      networkInfo: enhancedError.networkInfo
+    });
+
+    return Promise.reject(enhancedError);
   }
 );
+
+export default api;
 
 // Message related API calls
 export const getConversations = async () => {
@@ -738,5 +599,3 @@ export const leaveSession = async (sessionId) => {
     throw error;
   }
 };
-
-export default api;
